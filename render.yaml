@@ -1,7 +1,7 @@
 services:
   - type: web
-    name: melbot
+    name: mel-bot-website
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"  # Replace with the actual command to start your app
+    branch: main
