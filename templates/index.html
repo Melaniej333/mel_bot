@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>💖 Stacy the Bunny Bot 💖</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>💖 Hi, I'm Stacy the Bunny Bot! 💖</h1>
+        <p>Ask me a question, and I'll try to answer to the best of my abilities! You can also teach me if I don't know something!</p>
+        <div id="chat-box">
+            <div id="chat-log"></div>
+            <input type="text" id="user-input" placeholder="Type something...">
+            <button id="send-btn">Send</button>
+        </div>
+    </div>
+
+    <script>
+        async function sendMessage() {
+            const userInput = document.getElementById("user-input").value;
+            const chatLog = document.getElementById("chat-log");
+
+            // Add user's message to the chat log
+            chatLog.innerHTML += `<div class="user-message">You: ${userInput}</div>`;
+
+            // Get bot's response
+            const response = await fetch("/get_response", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ input: userInput }),
+            });
+
+            const data = await response.json();
+            if (data.response === "I don't know the answer to that. Can you teach me?") {
+                const answer = prompt("I don't know the answer. Can you teach me?");
+                if (answer) {
+                    await fetch("/teach_bot", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                        },
+                        body: JSON.stringify({ input: userInput, answer: answer }),
+                    });
+                    chatLog.innerHTML += `<div class="bot-message">Stacy: Thank you! I've learned something new. 💖</div>`;
+                }
+            } else {
+                chatLog.innerHTML += `<div class="bot-message">Stacy: ${data.response}</div>`;
+            }
+
+            // Clear the input field
+            document.getElementById("user-input").value = "";
+            // Scroll to the bottom of the chat log
+            chatLog.scrollTop = chatLog.scrollHeight;
+        }
+
+        document.getElementById("send-btn").addEventListener("click", sendMessage);
+        document.getElementById("user-input").addEventListener("keypress", (e) => {
+            if (e.key === "Enter") sendMessage();
+        });
+    </script>
+</body>
+</html>
