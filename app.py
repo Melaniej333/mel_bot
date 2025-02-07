@@ -5,11 +5,6 @@ import json
 import os
 import string
 
-app = Flask(__name__)
-
-KNOWLEDGE_FILE = "knowledge_base.json"
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
 class QuestionContext:
     def __init__(self):
         self.original_question = None
@@ -18,8 +13,17 @@ class QuestionContext:
         self.current_question = None
         self.waiting_for_correction = False
         self.question_to_correct = None
+        self.suggested_questions = []
+        self.last_question = None
+        self.is_clarifying = False
+        self.needs_correction = False
 
 question_context = QuestionContext()
+
+app = Flask(__name__)
+
+KNOWLEDGE_FILE = "knowledge_base.json"
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def load_knowledge_base():
     if os.path.exists(KNOWLEDGE_FILE):
@@ -30,64 +34,86 @@ def load_knowledge_base():
 def save_knowledge_base(knowledge_base):
     with open(KNOWLEDGE_FILE, "w") as file:
         json.dump(knowledge_base, file, indent=4)
+    print("Knowledge base saved successfully!")
 
 def normalize_input(input_text):
     input_text = input_text.translate(str.maketrans("", "", string.punctuation))
     input_text = " ".join(input_text.lower().split())
     return input_text
 
+def update_answer(knowledge_base, question, new_answer):
+    """Update the answer for a question and all its similar questions."""
+    print(f"Updating knowledge base with: {question} -> {new_answer}")
+    knowledge_base[question] = new_answer
+    save_knowledge_base(knowledge_base)
+
+def store_similar_question(knowledge_base, original_question, matched_question):
+    """Store a new question with the same answer as its matched question."""
+    if matched_question in knowledge_base:
+        answer = knowledge_base[matched_question]
+        knowledge_base[original_question] = answer
+        save_knowledge_base(knowledge_base)
+        print(f"Stored similar question: {original_question} -> {answer}")
+
 def get_response(knowledge_base, question):
     normalized_question = normalize_input(question)
     question_context.current_question = normalized_question
-    
+
+    if normalized_question == "no":
+        return {
+            "type": "learning",
+            "response": "What is the correct answer?"
+        }
+
     if not knowledge_base:
+        question_context.original_question = normalized_question
+        question_context.waiting_for_answer = True
         return {
             "type": "learning",
             "response": "I don't know the answer to that. Can you teach me?"
         }
 
-    matches = process.extract(normalized_question, knowledge_base.keys(), limit=1)
-    fuzzy_score = 0
-    fuzzy_response = None
-    if matches:
-        closest_question, fuzzy_score, _ = matches[0]
-        fuzzy_response = knowledge_base[closest_question]
-
-    question_embedding = model.encode(normalized_question, convert_to_tensor=True)
-    knowledge_base_questions = list(knowledge_base.keys())
-    knowledge_base_embeddings = model.encode(knowledge_base_questions, convert_to_tensor=True)
-
-    similarities = util.cos_sim(question_embedding, knowledge_base_embeddings)[0]
-    best_match_index = similarities.argmax().item()
-    best_match_score = similarities[best_match_index].item()
-    best_match_question = knowledge_base_questions[best_match_index]
-    semantic_response = knowledge_base[best_match_question]
-
-    fuzzy_threshold = 80
-    semantic_threshold = 0.7
-
-    question_context.original_question = normalized_question
-
-    # Direct match found with high confidence
-    if fuzzy_score >= fuzzy_threshold or best_match_score >= semantic_threshold:
-        best_match = closest_question if fuzzy_score >= fuzzy_threshold else best_match_question
-        question_context.question_to_correct = best_match
+    matches = process.extract(normalized_question, knowledge_base.keys(), limit=2)
+    if not matches:
+        question_context.original_question = normalized_question
+        question_context.waiting_for_answer = True
         return {
-            "type": "answer",
-            "response": knowledge_base[best_match]
+            "type": "learning",
+            "response": "I don't know the answer to that. Can you teach me?"
         }
 
-    # No good match found
-    return {
-        "type": "learning",
-        "response": "I don't know the answer to that. Can you teach me?"
-    }
+    closest_question, closest_score = matches[0][0], matches[0][1]
+    second_question, second_score = matches[1][0], matches[1][1]
 
-def update_answer(knowledge_base, question, new_answer):
-    """Update the answer for a question and all its similar questions."""
-    if question in knowledge_base:
-        knowledge_base[question] = new_answer
-        save_knowledge_base(knowledge_base)
+    fuzzy_threshold = 90
+    score_difference_threshold = 10
+
+    if closest_score >= fuzzy_threshold:
+        question_context.last_question = closest_question
+        question_context.original_question = normalized_question
+        # Store the similar question if it's not already in the knowledge base
+        if normalized_question not in knowledge_base:
+            store_similar_question(knowledge_base, normalized_question, closest_question)
+        return {
+            "type": "answer",
+            "response": knowledge_base[closest_question]
+        }
+
+    if abs(closest_score - second_score) < score_difference_threshold:
+        question_context.suggested_questions = [closest_question, second_question]
+        question_context.is_clarifying = True
+        question_context.original_question = normalized_question
+        return {
+            "type": "clarification",
+            "response": f"Did you mean one of these?\n1. {closest_question}\n2. {second_question}\nPlease reply with '1', '2', or 'no'."
+        }
+
+    question_context.last_question = closest_question
+    question_context.original_question = normalized_question
+    return {
+        "type": "answer",
+        "response": knowledge_base[closest_question]
+    }
 
 @app.route("/")
 def home():
@@ -106,42 +132,67 @@ def get_bot_response():
         knowledge_base = load_knowledge_base()
         normalized_input = normalize_input(user_input)
 
-        # Handle "no" response and corrections
-        if question_context.question_to_correct and normalized_input == "no":
-            question_context.waiting_for_correction = True
-            return jsonify({
-                "type": "correction",
-                "response": "What is the correct answer?"
-            })
+        if normalized_input == "no":
+            if question_context.original_question:
+                question_context.waiting_for_answer = True
+                question_context.needs_correction = True
+                return jsonify({
+                    "type": "learning",
+                    "response": "What is the correct answer?"
+                })
+            else:
+                return jsonify({
+                    "type": "error",
+                    "response": "I'm not sure what you're saying 'no' to. Please ask your question again."
+                })
 
-        # Handle the correction if we're waiting for one
-        if question_context.waiting_for_correction:
-            update_answer(knowledge_base, question_context.question_to_correct, user_input)
-            # Reset the correction context
-            question_context.waiting_for_correction = False
-            question_context.question_to_correct = None
-            return jsonify({
-                "type": "success",
-                "response": "Oops thanks for the correction! I've updated my knowledge database! <3"
-            })
+        if question_context.waiting_for_answer and question_context.needs_correction:
+            if question_context.original_question:
+                update_answer(knowledge_base, question_context.original_question, user_input)
+                question_context.waiting_for_answer = False
+                question_context.needs_correction = False
+                question_context.original_question = None
+                return jsonify({
+                    "type": "success",
+                    "response": "Thank you! I've updated my knowledge with the correct answer. 💖"
+                })
 
-        # If we're waiting for an answer to a new question
-        if question_context.waiting_for_answer:
-            knowledge_base[question_context.original_question] = user_input
-            save_knowledge_base(knowledge_base)
-            
-            # Reset all context
+        if question_context.is_clarifying:
+            if normalized_input in ["1", "2"]:
+                selected_index = int(normalized_input) - 1
+                selected_question = question_context.suggested_questions[selected_index]
+                
+                # Store the original question with the same answer as the selected question
+                if question_context.original_question and question_context.original_question != selected_question:
+                    store_similar_question(knowledge_base, question_context.original_question, selected_question)
+                
+                question_context.last_question = selected_question
+                question_context.is_clarifying = False
+                return jsonify({
+                    "type": "answer",
+                    "response": knowledge_base[selected_question]
+                })
+            elif normalized_input == "no":
+                question_context.waiting_for_answer = True
+                question_context.needs_correction = True
+                return jsonify({
+                    "type": "learning",
+                    "response": "What is the correct answer?"
+                })
+
+        if question_context.waiting_for_answer and not question_context.needs_correction:
+            update_answer(knowledge_base, question_context.original_question, user_input)
             question_context.waiting_for_answer = False
             question_context.original_question = None
             question_context.possible_matches = []
             question_context.current_question = None
-            
+            question_context.suggested_questions = []
+            question_context.last_question = None
+            question_context.is_clarifying = False
             return jsonify({
                 "type": "success",
                 "response": "Thank you! I've learned something new. 💖"
             })
-
-        # Normal flow for new questions
         response = get_response(knowledge_base, user_input)
         return jsonify(response)
 
@@ -153,6 +204,5 @@ def get_bot_response():
         })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))  # Get Render's assigned port
-    app.run(host="0.0.0.0", port=port)  # Bind to 0.0.0.0
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port)
